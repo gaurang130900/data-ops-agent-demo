@@ -120,7 +120,20 @@ def get_airflow_logs(dag_id: str, task_id: str) -> str:
         if log_resp.status_code == 200:
             try:
                 data = log_resp.json()
-                log_content = data.get("content", log_resp.text)
+                content = data.get("content") if isinstance(data, dict) else data
+                # Airflow v3: content is a list of {"event": "..."} objects
+                # Airflow v2: content is a plain string
+                if isinstance(content, list):
+                    lines = [
+                        entry.get("event", "")
+                        for entry in content
+                        if isinstance(entry, dict) and entry.get("event")
+                    ]
+                    log_content = "\n".join(lines) if lines else log_resp.text
+                elif isinstance(content, str):
+                    log_content = content
+                else:
+                    log_content = log_resp.text
             except ValueError:
                 log_content = log_resp.text
             logger.info(

@@ -289,3 +289,123 @@ class TestRaiseGithubPr:
             )
 
         assert captured_title.get("title") == "Fix: Schema mismatch in stg_customers.sql"
+
+    def test_raise_github_pr_repo_not_found(self, monkeypatch):
+        """Repository not found returns an error string."""
+        monkeypatch.setenv("GITHUB_TOKEN", "valid-token")
+
+        mock_g = MagicMock()
+        mock_g.get_user.return_value.login = "test-user"
+        mock_g.get_repo.side_effect = GithubException(404, {"message": "Not Found"}, None)
+
+        with patch("agent.tools.Github", return_value=mock_g):
+            result = raise_github_pr("owner/nonexistent", "file.sql", "SELECT 1")
+
+        assert "Error:" in result
+        assert "nonexistent" in result or "not found" in result.lower() or "not accessible" in result.lower()
+
+    def test_raise_github_pr_branch_creation_failure(self, monkeypatch):
+        """Branch creation failure returns an error string."""
+        monkeypatch.setenv("GITHUB_TOKEN", "valid-token")
+
+        mock_branch = MagicMock()
+        mock_branch.commit.sha = "abc123"
+
+        mock_repo = MagicMock()
+        mock_repo.get_branch.return_value = mock_branch
+        mock_repo.create_git_ref.side_effect = GithubException(
+            422, {"message": "Reference already exists"}, None
+        )
+
+        mock_g = MagicMock()
+        mock_g.get_user.return_value.login = "test-user"
+        mock_g.get_repo.return_value = mock_repo
+
+        with patch("agent.tools.Github", return_value=mock_g):
+            result = raise_github_pr("owner/repo", "file.sql", "SELECT 1")
+
+        assert "Error:" in result
+
+    def test_raise_github_pr_file_not_found(self, monkeypatch):
+        """File not found in repo returns an error string."""
+        monkeypatch.setenv("GITHUB_TOKEN", "valid-token")
+
+        mock_branch = MagicMock()
+        mock_branch.commit.sha = "abc123"
+
+        mock_repo = MagicMock()
+        mock_repo.get_branch.return_value = mock_branch
+        mock_repo.create_git_ref.return_value = MagicMock()
+        mock_repo.get_contents.side_effect = GithubException(404, {"message": "Not Found"}, None)
+
+        mock_g = MagicMock()
+        mock_g.get_user.return_value.login = "test-user"
+        mock_g.get_repo.return_value = mock_repo
+
+        with patch("agent.tools.Github", return_value=mock_g):
+            result = raise_github_pr("owner/repo", "nonexistent/file.sql", "SELECT 1")
+
+        assert "Error:" in result
+
+    def test_raise_github_pr_update_file_failure(self, monkeypatch):
+        """File update failure returns an error string."""
+        monkeypatch.setenv("GITHUB_TOKEN", "valid-token")
+
+        mock_branch = MagicMock()
+        mock_branch.commit.sha = "abc123"
+
+        mock_file_contents = MagicMock()
+        mock_file_contents.sha = "def456"
+
+        mock_repo = MagicMock()
+        mock_repo.get_branch.return_value = mock_branch
+        mock_repo.create_git_ref.return_value = MagicMock()
+        mock_repo.get_contents.return_value = mock_file_contents
+        mock_repo.update_file.side_effect = GithubException(
+            409, {"message": "Conflict"}, None
+        )
+
+        mock_g = MagicMock()
+        mock_g.get_user.return_value.login = "test-user"
+        mock_g.get_repo.return_value = mock_repo
+
+        with patch("agent.tools.Github", return_value=mock_g):
+            result = raise_github_pr("owner/repo", "file.sql", "SELECT 1")
+
+        assert "Error:" in result
+
+    def test_raise_github_pr_pr_creation_failure(self, monkeypatch):
+        """PR creation failure returns an error string."""
+        monkeypatch.setenv("GITHUB_TOKEN", "valid-token")
+
+        mock_branch = MagicMock()
+        mock_branch.commit.sha = "abc123"
+
+        mock_file_contents = MagicMock()
+        mock_file_contents.sha = "def456"
+
+        mock_repo = MagicMock()
+        mock_repo.get_branch.return_value = mock_branch
+        mock_repo.create_git_ref.return_value = MagicMock()
+        mock_repo.get_contents.return_value = mock_file_contents
+        mock_repo.update_file.return_value = MagicMock()
+        mock_repo.create_pull.side_effect = GithubException(
+            422, {"message": "Validation Failed"}, None
+        )
+
+        mock_g = MagicMock()
+        mock_g.get_user.return_value.login = "test-user"
+        mock_g.get_repo.return_value = mock_repo
+
+        with patch("agent.tools.Github", return_value=mock_g):
+            result = raise_github_pr("owner/repo", "file.sql", "SELECT 1")
+
+        assert "Error:" in result
+
+    def test_raise_github_pr_returns_string(self, monkeypatch):
+        """Return type is always str regardless of outcome."""
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+        result = raise_github_pr("owner/repo", "file.sql", "SELECT 1")
+
+        assert isinstance(result, str)

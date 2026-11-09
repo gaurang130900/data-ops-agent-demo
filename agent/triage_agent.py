@@ -21,8 +21,10 @@ Usage::
 import json
 import logging
 import os
+import time
 
 import google.generativeai as genai
+from google.api_core.exceptions import DeadlineExceeded, ServiceUnavailable
 from dotenv import load_dotenv
 
 from agent.tools import get_airflow_logs, get_snowflake_schema, raise_github_pr
@@ -220,6 +222,26 @@ class TriageAgent:
         logger.info("Gemini GenerativeModel initialised with %d tool(s).", len(tools[0].function_declarations))
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _send_with_retry(chat, message, request_options, max_retries: int = 3):
+        """Send a message with exponential-backoff retry on transient 504/503 errors."""
+        for attempt in range(max_retries):
+            try:
+                return chat.send_message(message, request_options=request_options)
+            except (DeadlineExceeded, ServiceUnavailable) as exc:
+                if attempt == max_retries - 1:
+                    raise
+                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s
+                logger.warning(
+                    "Gemini API transient error (%s), retrying in %ds (attempt %d/%d)...",
+                    exc.__class__.__name__, wait, attempt + 1, max_retries,
+                )
+                time.sleep(wait)
+
+    # ------------------------------------------------------------------
     # Main orchestration
     # ------------------------------------------------------------------
 
@@ -274,8 +296,12 @@ Use the GitHub repo: {os.environ.get("GITHUB_REPO", "your-org/data-ops-agent-dem
         )
 
         # Start a multi-turn chat session so Gemini can maintain context
+        # request_options sets a generous deadline for agentic multi-tool workflows.
+        # google-generativeai 0.8.x accepts a plain dict with a "timeout" key (seconds).
+        _request_options = {"timeout": 600}
+
         chat = self.model.start_chat()
-        response = chat.send_message(initial_prompt)
+        response = self._send_with_retry(chat, initial_prompt, _request_options)
 
         # ------------------------------------------------------------------
         # Function-calling loop (max 10 iterations to prevent infinite loops)
@@ -339,7 +365,7 @@ Use the GitHub repo: {os.environ.get("GITHUB_REPO", "your-org/data-ops-agent-dem
                 )
 
             # Send all tool results back to Gemini in a single turn
-            response = chat.send_message(function_responses)
+            response = self._send_with_retry(chat, function_responses, _request_options)
 
         # ------------------------------------------------------------------
         # Extract the final text summary from the last Gemini response
