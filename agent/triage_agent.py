@@ -3,13 +3,18 @@ Triage Agent Module for the Autonomous Data Pipeline Healing Agent.
 
 This module implements the TriageAgent class, which uses Google Gemini's native
 function-calling capability to autonomously diagnose and repair Airflow/dbt
-pipeline failures caused by Snowflake schema mismatches.
+pipeline failures using a strict six-step Audit Workflow.
+
+Migrated to the modern `google-genai` SDK (>=1.0), which supports Gemini 3.x
+models and the "thought signatures" required for multi-turn function calling.
 
 Workflow orchestrated by TriageAgent.heal_pipeline():
-  1. Retrieve Airflow task execution logs to identify the root cause.
-  2. Query Snowflake to obtain the actual column names for the affected table.
-  3. Generate corrected SQL with appropriate column aliasing.
-  4. Raise a GitHub Pull Request containing the fix.
+  1. DIAGNOSE    - read Airflow/dbt logs to find the failing model and cause.
+  2. INSPECT     - read the raw .sql model code.
+  3. HYPOTHESIZE - formulate a corrected SQL fix.
+  4. AUDIT       - validate the fix against Snowflake (SELECT ... LIMIT 5).
+  5. ITERATE     - on audit error, revise and re-test until it passes.
+  6. COMMIT      - only after a passing audit, raise a GitHub PR.
 
 Usage::
 
@@ -23,8 +28,9 @@ import logging
 import os
 import time
 
-import google.generativeai as genai
-from google.api_core.exceptions import DeadlineExceeded, ServiceUnavailable
+from google import genai
+from google.genai import types
+from google.genai import errors as genai_errors
 from dotenv import load_dotenv
 
 from agent.tools import (
@@ -53,24 +59,20 @@ class TriageAgent:
     """
     AI-powered triage agent that autonomously heals data pipeline failures.
 
-    The agent leverages Google Gemini's function-calling interface to coordinate
-    three tool functions (Airflow log retrieval, Snowflake schema introspection,
-    and GitHub PR creation) in a closed-loop healing workflow.
-
-    Attributes:
-        api_key (str): Gemini API key loaded from the environment.
-        github_token (str): GitHub personal access token loaded from the environment.
-        model (genai.GenerativeModel): Configured Gemini model with tool definitions.
+    Leverages Gemini's function-calling interface (via the google-genai SDK) to
+    coordinate five tools (Airflow logs, Snowflake schema, code reading, the
+    Snowflake audit query, and GitHub PR creation) in a closed-loop workflow.
     """
 
-    # Gemini model to use. This account requires gemini-3.8-flash (the API returns
-    # a 404 for gemini-2.5-flash: "no longer available to new users").
-    MODEL_NAME = "gemini-3.8-flash"
+    # Gemini model to use.
+    # gemini-3.8-flash hits its 20/day free-tier cap quickly; gemini-3.1-flash-lite
+    # has a 500/day limit and is valid for this account (verified via /v1beta/models).
+    MODEL_NAME = "gemini-3.1-flash-lite"
 
-    # System instruction enforcing the strict, generalized Audit Workflow. This
-    # turns the agent into a general-purpose self-healer for any dbt/SQL failure
-    # (syntax errors, schema mismatches, invalid casts, etc.) and makes the
-    # execute_test_query verification a HARD GATE before any Pull Request.
+    # Max turns in the function-calling loop (prevents runaway execution).
+    MAX_ITERATIONS = 12
+
+    # System instruction enforcing the strict, generalized Audit Workflow.
     SYSTEM_INSTRUCTION = """
 You are an autonomous Data SRE (Site Reliability Engineer) agent responsible for
 diagnosing and repairing failed Airflow/dbt data pipelines. You are a GENERALIZED
@@ -134,16 +136,7 @@ HARD RULES:
     # ------------------------------------------------------------------
 
     def load_environment(self) -> None:
-        """
-        Load environment variables from the .env file and validate required keys.
-
-        Calls load_dotenv() to populate os.environ from the project's .env file,
-        then reads and validates GEMINI_API_KEY and GITHUB_TOKEN.
-
-        Raises:
-            ValueError: If GEMINI_API_KEY is absent or empty.
-            ValueError: If GITHUB_TOKEN is absent or empty.
-        """
+        """Load and validate GEMINI_API_KEY and GITHUB_TOKEN from the environment."""
         load_dotenv()
 
         self.api_key = os.environ.get("GEMINI_API_KEY")
@@ -163,210 +156,222 @@ HARD RULES:
         logger.info("Environment variables loaded successfully.")
 
     def initialize_gemini(self) -> None:
-        """
-        Configure the Gemini client and create a GenerativeModel with tool definitions.
-
-        Defines FunctionDeclarations for the three tool functions and registers
-        them with the Gemini model so the model can request their invocation
-        during the function-calling loop.
-        """
-        # Force the REST transport. The default gRPC transport can stall on some
-        # networks (plain HTTPS/REST works reliably), causing hangs/504s.
-        genai.configure(api_key=self.api_key, transport="rest")
-        logger.info("Gemini API configured with model: %s (transport=rest)", self.MODEL_NAME)
+        """Create the google-genai client and build the Tool / config objects."""
+        # The google-genai client talks to the Gemini Developer API over HTTPS/REST.
+        self.client = genai.Client(api_key=self.api_key)
+        logger.info("Gemini client initialised with model: %s", self.MODEL_NAME)
 
         # ------------------------------------------------------------------
-        # Tool 1: get_airflow_logs
+        # Tool declarations (one Tool bundling all five function declarations)
         # ------------------------------------------------------------------
-        get_airflow_logs_declaration = genai.protos.FunctionDeclaration(
-            name="get_airflow_logs",
-            description=(
-                "Retrieves task execution logs from the Airflow REST API for a "
-                "failed DAG task. Use this as the first step when diagnosing any "
-                "Airflow pipeline failure."
-            ),
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "dag_id": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="The Airflow DAG identifier (e.g. 'ingest_to_snowflake').",
+        self.tool = types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name="get_airflow_logs",
+                    description=(
+                        "Retrieves task execution logs from the Airflow REST API for a "
+                        "failed DAG task. Use this as the first step when diagnosing any "
+                        "Airflow pipeline failure."
                     ),
-                    "task_id": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description=(
-                            "The task identifier within the DAG "
-                            "(e.g. 'run_stg_customers')."
-                        ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "dag_id": types.Schema(
+                                type=types.Type.STRING,
+                                description="The Airflow DAG identifier (e.g. 'ingest_to_snowflake').",
+                            ),
+                            "task_id": types.Schema(
+                                type=types.Type.STRING,
+                                description="The task identifier within the DAG (e.g. 'run_stg_customers').",
+                            ),
+                        },
+                        required=["dag_id", "task_id"],
                     ),
-                },
-                required=["dag_id", "task_id"],
-            ),
+                ),
+                types.FunctionDeclaration(
+                    name="get_snowflake_schema",
+                    description=(
+                        "Queries Snowflake to retrieve actual column names and types for a "
+                        "given table. Use this after identifying a schema mismatch in the "
+                        "Airflow logs to discover the real column names."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "table_name": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "Fully qualified table name in DATABASE.SCHEMA.TABLE "
+                                    "format (e.g. 'DATA_OPS_DEMO.RAW.RAW_CUSTOMERS')."
+                                ),
+                            ),
+                        },
+                        required=["table_name"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name="read_code_file",
+                    description=(
+                        "Reads the raw text content of a source file (e.g. a failing dbt "
+                        ".sql model). Use this during the Inspect step to see the ACTUAL "
+                        "code of the failing model before formulating a fix. The path is "
+                        "relative to the Airflow dags folder "
+                        "(e.g. 'dbt_project/models/stg_customers.sql')."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "filepath": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "Path to the file relative to the Airflow dags folder "
+                                    "(e.g. 'dbt_project/models/stg_customers.sql')."
+                                ),
+                            ),
+                        },
+                        required=["filepath"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name="execute_test_query",
+                    description=(
+                        "AUDIT LAYER. Executes a candidate SQL query against Snowflake and "
+                        "returns the result rows on success, or the EXACT Snowflake "
+                        "compilation/execution error on failure. You MUST use this to prove "
+                        "a proposed SQL fix actually compiles and handles the raw data "
+                        "correctly BEFORE raising any Pull Request. Use a bounded query such "
+                        "as 'SELECT ... LIMIT 5' against the underlying raw tables. Resolve "
+                        "any dbt Jinja (e.g. {{ source(...) }}) to real DATABASE.SCHEMA.TABLE "
+                        "names before calling. If it returns an error, read the error, revise "
+                        "your SQL, and call this tool again until it succeeds."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "query": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "The raw Snowflake SQL query to validate "
+                                    "(e.g. 'SELECT cust_id AS customer_id, email FROM "
+                                    "DATA_OPS_DEMO.RAW.RAW_CUSTOMERS LIMIT 5')."
+                                ),
+                            ),
+                        },
+                        required=["query"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name="raise_github_pr",
+                    description=(
+                        "Creates a GitHub branch and raises a Pull Request with corrected "
+                        "SQL to fix a pipeline failure. Use this as the final step ONLY "
+                        "after execute_test_query has returned a SUCCESS result."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "repo_name": types.Schema(
+                                type=types.Type.STRING,
+                                description="GitHub repository in 'owner/repo' format.",
+                            ),
+                            "file_path": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "Path to the file within the repository to update "
+                                    "(e.g. 'dbt_project/models/stg_customers.sql')."
+                                ),
+                            ),
+                            "new_sql": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "Corrected SQL content to write to the file "
+                                    "(keep dbt Jinja such as {{ source(...) }})."
+                                ),
+                            ),
+                        },
+                        required=["repo_name", "file_path", "new_sql"],
+                    ),
+                ),
+            ]
         )
 
-        # ------------------------------------------------------------------
-        # Tool 2: get_snowflake_schema
-        # ------------------------------------------------------------------
-        get_snowflake_schema_declaration = genai.protos.FunctionDeclaration(
-            name="get_snowflake_schema",
-            description=(
-                "Queries Snowflake to retrieve actual column names and types for a "
-                "given table. Use this after identifying a schema mismatch in the "
-                "Airflow logs to discover the real column names."
-            ),
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "table_name": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description=(
-                            "Fully qualified table name in DATABASE.SCHEMA.TABLE "
-                            "format (e.g. 'DATA_OPS_DEMO.RAW.RAW_CUSTOMERS')."
-                        ),
-                    ),
-                },
-                required=["table_name"],
-            ),
-        )
-
-        # ------------------------------------------------------------------
-        # Tool 3: read_code_file
-        # ------------------------------------------------------------------
-        read_code_file_declaration = genai.protos.FunctionDeclaration(
-            name="read_code_file",
-            description=(
-                "Reads the raw text content of a source file (e.g. a failing dbt "
-                ".sql model). Use this during the Inspect step to see the ACTUAL "
-                "code of the failing model before formulating a fix. The path is "
-                "relative to the Airflow dags folder "
-                "(e.g. 'dbt_project/models/stg_customers.sql')."
-            ),
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "filepath": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description=(
-                            "Path to the file relative to the Airflow dags folder "
-                            "(e.g. 'dbt_project/models/stg_customers.sql')."
-                        ),
-                    ),
-                },
-                required=["filepath"],
-            ),
-        )
-
-        # ------------------------------------------------------------------
-        # Tool 4: execute_test_query (Audit Layer)
-        # ------------------------------------------------------------------
-        execute_test_query_declaration = genai.protos.FunctionDeclaration(
-            name="execute_test_query",
-            description=(
-                "AUDIT LAYER. Executes a candidate SQL query against Snowflake and "
-                "returns the result rows on success, or the EXACT Snowflake "
-                "compilation/execution error on failure. You MUST use this to prove "
-                "a proposed SQL fix actually compiles and handles the raw data "
-                "correctly BEFORE raising any Pull Request. Use a bounded query such "
-                "as 'SELECT ... LIMIT 5' against the underlying raw tables. Resolve "
-                "any dbt Jinja (e.g. {{ source(...) }}) to real DATABASE.SCHEMA.TABLE "
-                "names before calling. If it returns an error, read the error, revise "
-                "your SQL, and call this tool again until it succeeds."
-            ),
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "query": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description=(
-                            "The raw Snowflake SQL query to validate "
-                            "(e.g. 'SELECT cust_id AS customer_id, email FROM "
-                            "DATA_OPS_DEMO.RAW.RAW_CUSTOMERS LIMIT 5')."
-                        ),
-                    ),
-                },
-                required=["query"],
-            ),
-        )
-
-        # ------------------------------------------------------------------
-        # Tool 5: raise_github_pr
-        # ------------------------------------------------------------------
-        raise_github_pr_declaration = genai.protos.FunctionDeclaration(
-            name="raise_github_pr",
-            description=(
-                "Creates a GitHub branch and raises a Pull Request with corrected "
-                "SQL to fix a schema mismatch. Use this as the final step once you "
-                "have generated the corrected SQL."
-            ),
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "repo_name": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description=(
-                            "GitHub repository in 'owner/repo' format "
-                            "(e.g. 'your-org/data-ops-agent-demo')."
-                        ),
-                    ),
-                    "file_path": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description=(
-                            "Path to the file within the repository to update "
-                            "(e.g. 'dbt_project/models/stg_customers.sql')."
-                        ),
-                    ),
-                    "new_sql": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description=(
-                            "Corrected SQL content to write to the file, with any "
-                            "schema mismatch columns aliased appropriately "
-                            "(e.g. 'cust_id AS customer_id')."
-                        ),
-                    ),
-                },
-                required=["repo_name", "file_path", "new_sql"],
-            ),
-        )
-
-        # Bundle the declarations into a single Tool object for the model
-        tools = [
-            genai.protos.Tool(
-                function_declarations=[
-                    get_airflow_logs_declaration,
-                    get_snowflake_schema_declaration,
-                    read_code_file_declaration,
-                    execute_test_query_declaration,
-                    raise_github_pr_declaration,
-                ]
-            )
-        ]
-
-        self.model = genai.GenerativeModel(
-            model_name=self.MODEL_NAME,
-            tools=tools,
+        # Generation config: register the tool and the system instruction.
+        self.generate_config = types.GenerateContentConfig(
+            tools=[self.tool],
             system_instruction=self.SYSTEM_INSTRUCTION,
+            temperature=0,
         )
-        logger.info("Gemini GenerativeModel initialised with %d tool(s).", len(tools[0].function_declarations))
+        logger.info("Gemini tools configured (5 function declarations).")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _send_with_retry(chat, message, request_options, max_retries: int = 3):
-        """Send a message with exponential-backoff retry on transient 504/503 errors."""
+    def _generate_with_retry(self, contents, max_retries: int = 3):
+        """Call generate_content with exponential-backoff retry on transient errors."""
         for attempt in range(max_retries):
             try:
-                return chat.send_message(message, request_options=request_options)
-            except (DeadlineExceeded, ServiceUnavailable) as exc:
+                return self.client.models.generate_content(
+                    model=self.MODEL_NAME,
+                    contents=contents,
+                    config=self.generate_config,
+                )
+            except genai_errors.ServerError as exc:
+                # 5xx (incl. 503/504) — retry with backoff.
                 if attempt == max_retries - 1:
                     raise
-                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s
+                wait = 10 * (2 ** attempt)
                 logger.warning(
-                    "Gemini API transient error (%s), retrying in %ds (attempt %d/%d)...",
+                    "Gemini server error (%s), retrying in %ds (attempt %d/%d)...",
                     exc.__class__.__name__, wait, attempt + 1, max_retries,
                 )
                 time.sleep(wait)
+
+    def _dispatch_tool(self, name: str, args: dict):
+        """Execute the named Python tool and return (response_dict, pr_url_or_none)."""
+        logger.info("Executing tool: %s(%s)", name, json.dumps(args))
+        pr_url = None
+
+        if name == "get_airflow_logs":
+            result = get_airflow_logs(**args)
+            logger.info(
+                "get_airflow_logs returned %d chars. Preview: %s",
+                len(result) if isinstance(result, str) else 0,
+                (result[:300] if isinstance(result, str) else str(result)),
+            )
+            return {"result": result}, pr_url
+
+        if name == "get_snowflake_schema":
+            return get_snowflake_schema(**args), pr_url
+
+        if name == "read_code_file":
+            result = read_code_file(**args)
+            logger.info(
+                "read_code_file returned %d chars. Preview: %s",
+                len(result) if isinstance(result, str) else 0,
+                (result[:300] if isinstance(result, str) else str(result)),
+            )
+            return {"result": result}, pr_url
+
+        if name == "execute_test_query":
+            result = execute_test_query(**args)
+            audit_ok = isinstance(result, str) and result.startswith("SUCCESS:")
+            logger.info(
+                "AUDIT execute_test_query -> %s. Preview: %s",
+                "PASS" if audit_ok else "FAIL",
+                (result[:300] if isinstance(result, str) else str(result)),
+            )
+            return {"result": result}, pr_url
+
+        if name == "raise_github_pr":
+            result = raise_github_pr(**args)
+            if isinstance(result, str) and not result.startswith("Error:"):
+                pr_url = result
+                logger.info("GitHub PR created: %s", pr_url)
+            return {"pr_url": result}, pr_url
+
+        logger.warning("Unknown function requested by model: %s", name)
+        return {"error": f"Unknown function: {name}"}, pr_url
 
     # ------------------------------------------------------------------
     # Main orchestration
@@ -374,33 +379,13 @@ HARD RULES:
 
     def heal_pipeline(self, dag_id: str, task_id: str) -> dict:
         """
-        Autonomously investigate a failed Airflow pipeline task and raise a fix PR.
+        Autonomously investigate a failed Airflow task and raise a verified fix PR.
 
-        Sends an initial diagnostic prompt to Gemini and enters a function-calling
-        loop where the model can request the execution of tool functions.  The loop
-        runs for a maximum of 10 iterations to prevent runaway execution.
-
-        Args:
-            dag_id:  The Airflow DAG identifier that experienced a failure.
-            task_id: The task identifier within the DAG that failed.
-
-        Returns:
-            A dictionary with the following keys:
-
-            - ``"status"`` (str): ``"success"`` if a PR was raised, otherwise
-              ``"completed_without_pr"``.
-            - ``"actions_taken"`` (list[str]): Ordered list of tool invocations
-              performed during the workflow.
-            - ``"pr_url"`` (str | None): The GitHub PR URL, or ``None`` if no PR
-              was created.
-            - ``"summary"`` (str): The final natural-language summary from Gemini.
+        Returns a dict with: status, actions_taken, pr_url, summary.
         """
         actions_taken: list[str] = []
         pr_url: str | None = None
 
-        # ------------------------------------------------------------------
-        # Initial prompt: describe the failure and instruct the agent
-        # ------------------------------------------------------------------
         initial_prompt = f"""
 An Airflow pipeline has failed and needs autonomous healing.
 DAG ID: {dag_id}
@@ -428,129 +413,77 @@ Do NOT raise a PR until execute_test_query has returned a SUCCESS result.
             "Starting healing workflow for dag_id='%s', task_id='%s'.", dag_id, task_id
         )
 
-        # Start a multi-turn chat session so Gemini can maintain context
-        # request_options sets a generous deadline for agentic multi-tool workflows.
-        # google-generativeai 0.8.x accepts a plain dict with a "timeout" key (seconds).
-        _request_options = {"timeout": 600}
+        # Conversation history as a list of Content turns. The google-genai SDK
+        # preserves thought_signatures automatically when we append the model's
+        # own Content back into this list — which is what Gemini 3.x requires.
+        contents: list[types.Content] = [
+            types.Content(role="user", parts=[types.Part(text=initial_prompt)])
+        ]
 
-        chat = self.model.start_chat()
-        response = self._send_with_retry(chat, initial_prompt, _request_options)
+        response = self._generate_with_retry(contents)
 
-        # ------------------------------------------------------------------
-        # Function-calling loop (max 10 iterations to prevent infinite loops)
-        # ------------------------------------------------------------------
-        for iteration in range(10):
+        for iteration in range(self.MAX_ITERATIONS):
             logger.info("Function-calling loop iteration %d.", iteration + 1)
 
-            # Collect all function call parts from the current response
-            function_calls = []
-            for part in response.parts:
-                if hasattr(part, "function_call") and part.function_call.name:
-                    function_calls.append(part.function_call)
+            candidate = response.candidates[0] if response.candidates else None
+            model_content = candidate.content if candidate else None
+
+            # Collect any function calls from this model turn.
+            function_calls = list(response.function_calls or [])
+
+            # Log any thinking/answer text the model produced this turn.
+            turn_text = "".join(
+                p.text for p in (model_content.parts if model_content and model_content.parts else [])
+                if getattr(p, "text", None)
+            )
+            if turn_text.strip():
+                logger.info("Gemini text (iteration %d): %s", iteration + 1, turn_text[:500])
 
             if not function_calls:
-                # Gemini returned a text-only response — the workflow is complete
-                logger.info("No function calls in response — workflow complete.")
+                logger.info("No function calls — workflow complete.")
                 break
 
-            # ------------------------------------------------------------------
-            # Dispatch each function call to the appropriate tool
-            # ------------------------------------------------------------------
-            function_responses: list[genai.protos.Part] = []
+            # Append the model's turn (with its function calls + thought signatures)
+            # to history so the next request echoes them back correctly.
+            if model_content is not None:
+                contents.append(model_content)
 
+            # Execute each requested tool and build function-response parts.
+            tool_response_parts: list[types.Part] = []
             for fc in function_calls:
-                func_name = fc.name
-                func_args = dict(fc.args)
+                args = dict(fc.args) if fc.args else {}
+                actions_taken.append(f"Called {fc.name}({args})")
 
-                logger.info("Executing tool: %s(%s)", func_name, json.dumps(func_args))
-                actions_taken.append(f"Called {func_name}({func_args})")
+                response_data, maybe_pr = self._dispatch_tool(fc.name, args)
+                if maybe_pr:
+                    pr_url = maybe_pr
 
-                # Route to the correct Python tool function
-                if func_name == "get_airflow_logs":
-                    result = get_airflow_logs(**func_args)
-                    response_data = {"result": result}
-                    logger.info(
-                        "get_airflow_logs returned %d chars. Preview: %s",
-                        len(result) if isinstance(result, str) else 0,
-                        (result[:300] if isinstance(result, str) else str(result)),
-                    )
-
-                elif func_name == "get_snowflake_schema":
-                    result = get_snowflake_schema(**func_args)
-                    # get_snowflake_schema already returns a dict
-                    response_data = result
-
-                elif func_name == "read_code_file":
-                    result = read_code_file(**func_args)
-                    response_data = {"result": result}
-                    logger.info(
-                        "read_code_file returned %d chars. Preview: %s",
-                        len(result) if isinstance(result, str) else 0,
-                        (result[:300] if isinstance(result, str) else str(result)),
-                    )
-
-                elif func_name == "execute_test_query":
-                    result = execute_test_query(**func_args)
-                    response_data = {"result": result}
-                    _audit_ok = isinstance(result, str) and result.startswith("SUCCESS:")
-                    logger.info(
-                        "AUDIT execute_test_query -> %s. Preview: %s",
-                        "PASS" if _audit_ok else "FAIL",
-                        (result[:300] if isinstance(result, str) else str(result)),
-                    )
-
-                elif func_name == "raise_github_pr":
-                    result = raise_github_pr(**func_args)
-                    response_data = {"pr_url": result}
-                    # Record the PR URL if creation succeeded
-                    if isinstance(result, str) and not result.startswith("Error:"):
-                        pr_url = result
-                        logger.info("GitHub PR created: %s", pr_url)
-
-                else:
-                    logger.warning("Unknown function requested by model: %s", func_name)
-                    response_data = {"error": f"Unknown function: {func_name}"}
-
-                # Wrap the tool result in a FunctionResponse Part for Gemini
-                function_responses.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=func_name,
-                            response={"result": response_data},
-                        )
+                tool_response_parts.append(
+                    types.Part.from_function_response(
+                        name=fc.name,
+                        response={"result": response_data},
                     )
                 )
 
-            # Send all tool results back to Gemini in a single turn
-            response = self._send_with_retry(chat, function_responses, _request_options)
+            # Send all tool results back in a single user turn.
+            contents.append(types.Content(role="user", parts=tool_response_parts))
 
-            # Log Gemini's reasoning text (if any) after receiving the tool results
-            turn_text = "".join(
-                part.text for part in response.parts
-                if hasattr(part, "text") and part.text
-            )
-            if turn_text.strip():
-                logger.info("Gemini response text after iteration %d: %s", iteration + 1, turn_text[:500])
-            next_calls = [
-                part.function_call.name for part in response.parts
-                if hasattr(part, "function_call") and part.function_call.name
-            ]
-            logger.info("Gemini next tool calls after iteration %d: %s", iteration + 1, next_calls or "none")
+            next_calls = [fc.name for fc in function_calls]
+            logger.info("Tools executed in iteration %d: %s", iteration + 1, next_calls)
 
-        # ------------------------------------------------------------------
-        # Extract the final text summary from the last Gemini response
-        # ------------------------------------------------------------------
+            response = self._generate_with_retry(contents)
+
+        # Final text summary from the last model response.
         final_text = ""
-        for part in response.parts:
-            if hasattr(part, "text") and part.text:
-                final_text += part.text
+        if response and response.candidates:
+            last = response.candidates[0].content
+            if last and last.parts:
+                final_text = "".join(p.text for p in last.parts if getattr(p, "text", None))
 
         status = "success" if pr_url else "completed_without_pr"
         logger.info(
             "Healing workflow finished. status=%s, actions=%d, pr_url=%s",
-            status,
-            len(actions_taken),
-            pr_url,
+            status, len(actions_taken), pr_url,
         )
 
         return {
