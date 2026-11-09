@@ -1,0 +1,10 @@
+google-generativeai==0.8.3
+snowflake-connector-python==3.12.4
+PyGithub==2.5.0
+python-dotenv==1.0.1
+apache-airflow==2.10.4
+pytest==8.3.4
+hypothesis==6.131.7
+requests-mock==1.12.1
+requests==2.32.3
+sqlparse==0.5.3
