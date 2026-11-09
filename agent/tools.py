@@ -1,9 +1,12 @@
 """
 Tool Functions Module for the Autonomous Data Pipeline Healing Agent.
 
-This module exposes three callable tools to the Gemini model via native function calling:
+This module exposes five callable tools to the Gemini model via native function calling:
   - get_airflow_logs: Retrieve task execution logs from the Airflow REST API.
-  - get_snowflake_schema: Introspect a Snowflake table's column metadata via REST API.
+  - get_snowflake_schema: Introspect a Snowflake table's column metadata.
+  - read_code_file: Read the raw text of a source file (e.g. a failing dbt .sql model).
+  - execute_test_query: Audit Layer — run a candidate SQL query against Snowflake and
+    return results on success or the exact compilation/execution error on failure.
   - raise_github_pr: Create a GitHub branch and open a Pull Request with corrected SQL.
 
 All functions:
@@ -76,10 +79,10 @@ def get_airflow_logs(dag_id: str, task_id: str) -> str:
             auth_headers = {"Accept": "application/json"}
             auth_tuple = (airflow_user, airflow_pass)
 
-        # Step 1: Get the most recent dag run ID
+        # Step 1: Get the most recent failed dag run ID (fall back to latest if none failed)
         runs_url = (
             f"{airflow_base_url}/api/v2/dags/{dag_id}/dagRuns"
-            f"?limit=1&order_by=-start_date"
+            f"?limit=10&order_by=-start_date"
         )
         runs_resp = requests.get(
             runs_url,
@@ -102,8 +105,13 @@ def get_airflow_logs(dag_id: str, task_id: str) -> str:
             logger.error(error_msg)
             return error_msg
 
-        run_id = dag_runs[0]["dag_run_id"]
-        logger.info("Most recent dag_run_id: %s", run_id)
+        # Prefer the most recent failed run so the agent diagnoses an actual failure
+        failed_runs = [r for r in dag_runs if r.get("state") == "failed"]
+        selected_run = failed_runs[0] if failed_runs else dag_runs[0]
+        run_id = selected_run["dag_run_id"]
+        logger.info(
+            "Selected dag_run_id: %s (state: %s)", run_id, selected_run.get("state")
+        )
 
         # Step 2: Get task logs for that run
         log_url = (
@@ -297,7 +305,210 @@ def get_snowflake_schema(table_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Tool 3: raise_github_pr
+# Tool 3: read_code_file
+# ---------------------------------------------------------------------------
+
+def _resolve_dags_base_dirs() -> list:
+    """
+    Build an ordered list of candidate base directories for resolving code files.
+
+    Resolution order:
+      1. The ``AIRFLOW_DAGS_DIR`` environment variable, if set.
+      2. The local repository's dbt project parent (``<repo>/``), so paths like
+         ``dbt_project/models/stg_customers.sql`` resolve inside the repo.
+      3. The mirrored host Airflow dags directory used by the Docker container.
+
+    Returns:
+        A list of absolute base directory paths to try, in priority order.
+    """
+    candidates = []
+
+    env_dir = os.environ.get("AIRFLOW_DAGS_DIR")
+    if env_dir:
+        candidates.append(env_dir)
+
+    # Local repo root: this file is at <repo>/agent/tools.py, so repo root is one up.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(repo_root)
+
+    # Mirrored host Airflow dags directory (Docker bind mount source).
+    candidates.append(r"C:\Users\gaura\Documents\airflow-local\dags")
+
+    return candidates
+
+
+def read_code_file(filepath: str) -> str:
+    """
+    Read and return the raw text content of a source file.
+
+    Intended for the agent to inspect the actual code of a failing dbt ``.sql``
+    model (or any other source file) before formulating a fix. The ``filepath``
+    is interpreted relative to the Airflow dags folder / project root. Several
+    candidate base directories are tried so the tool works both against the local
+    repository and the mirrored Airflow dags directory.
+
+    Args:
+        filepath: Path to the file, relative to the Airflow dags folder / repo
+                  root (e.g. ``"dbt_project/models/stg_customers.sql"``). An
+                  absolute path is also accepted and used as-is.
+
+    Returns:
+        The raw file contents as a string on success.
+        A descriptive error string prefixed with ``"Error:"`` if the file cannot
+        be found or read. This function never raises an exception.
+    """
+    logger.info("Reading code file: %s", filepath)
+
+    # Normalize separators so forward-slash paths work on Windows too.
+    normalized = filepath.replace("/", os.sep).replace("\\", os.sep).lstrip(os.sep)
+
+    # If an absolute path was provided, try it directly first.
+    tried: list = []
+    search_paths: list = []
+    if os.path.isabs(filepath):
+        search_paths.append(filepath)
+    for base in _resolve_dags_base_dirs():
+        search_paths.append(os.path.join(base, normalized))
+
+    for candidate in search_paths:
+        tried.append(candidate)
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+                logger.info("Read %d chars from %s", len(content), candidate)
+                return content
+            except OSError as exc:
+                error_msg = f"Error: Could not read file '{candidate}'. Details: {exc}"
+                logger.error(error_msg)
+                return error_msg
+
+    error_msg = (
+        f"Error: File not found: '{filepath}'. Searched the following locations: "
+        f"{'; '.join(tried)}. Provide a path relative to the Airflow dags folder "
+        f"(e.g. 'dbt_project/models/stg_customers.sql')."
+    )
+    logger.error(error_msg)
+    return error_msg
+
+
+# ---------------------------------------------------------------------------
+# Tool 4: execute_test_query (Audit Layer)
+# ---------------------------------------------------------------------------
+
+def execute_test_query(query: str) -> str:
+    """
+    Audit Layer: execute a candidate SQL query against Snowflake and report the outcome.
+
+    This is the verification gate the agent MUST use to prove a proposed SQL fix
+    actually compiles and runs against the real data before any Pull Request is
+    raised. Use a bounded query such as ``SELECT ... LIMIT 5`` against the
+    underlying raw tables.
+
+    Uses the official snowflake-connector-python library. Connection parameters
+    are read from the environment:
+        ``SNOWFLAKE_USER``, ``SNOWFLAKE_PASSWORD``, ``SNOWFLAKE_ACCOUNT``,
+        ``SNOWFLAKE_WAREHOUSE``, ``SNOWFLAKE_DATABASE``, ``SNOWFLAKE_SCHEMA``
+
+    Args:
+        query: The raw SQL query to execute. Must be valid Snowflake SQL (resolve
+               any dbt Jinja such as ``{{ source(...) }}`` to real
+               ``DATABASE.SCHEMA.TABLE`` names before calling).
+
+    Returns:
+        On success: a string containing the column headers and up to the returned
+        rows (JSON-serialized), prefixed with ``"SUCCESS:"``.
+        On failure: the exact Snowflake compilation/execution error message,
+        prefixed with ``"Error:"``, so the agent can read it and revise the fix.
+        This function never raises an exception.
+    """
+    logger.info("Audit Layer executing test query: %s", query[:300])
+
+    snowflake_user      = os.environ.get("SNOWFLAKE_USER")
+    snowflake_password  = os.environ.get("SNOWFLAKE_PASSWORD")
+    snowflake_account   = os.environ.get("SNOWFLAKE_ACCOUNT")
+    snowflake_warehouse = os.environ.get("SNOWFLAKE_WAREHOUSE")
+    snowflake_database  = os.environ.get("SNOWFLAKE_DATABASE")
+    snowflake_schema    = os.environ.get("SNOWFLAKE_SCHEMA")
+
+    missing = [
+        name for name, val in {
+            "SNOWFLAKE_USER":      snowflake_user,
+            "SNOWFLAKE_PASSWORD":  snowflake_password,
+            "SNOWFLAKE_ACCOUNT":   snowflake_account,
+            "SNOWFLAKE_WAREHOUSE": snowflake_warehouse,
+            "SNOWFLAKE_DATABASE":  snowflake_database,
+            "SNOWFLAKE_SCHEMA":    snowflake_schema,
+        }.items() if not val
+    ]
+    if missing:
+        error_msg = (
+            f"Error: Missing Snowflake environment variables: {', '.join(missing)}. "
+            "Please configure them in your .env file."
+        )
+        logger.error(error_msg)
+        return error_msg
+
+    if not query or not query.strip():
+        return "Error: Empty query provided to execute_test_query."
+
+    conn = None
+    cursor = None
+    try:
+        conn = snowflake.connector.connect(
+            user=snowflake_user,
+            password=snowflake_password,
+            account=snowflake_account,
+            warehouse=snowflake_warehouse,
+            database=snowflake_database,
+            schema=snowflake_schema,
+        )
+        cursor = conn.cursor()
+        cursor.execute(query)
+
+        columns = [col[0] for col in cursor.description] if cursor.description else []
+        rows = cursor.fetchall()
+
+        # Serialize rows defensively (handle dates/decimals/etc. via str fallback).
+        serializable_rows = [
+            [col if isinstance(col, (str, int, float, bool, type(None))) else str(col)
+             for col in row]
+            for row in rows
+        ]
+
+        result = {
+            "columns": columns,
+            "row_count": len(serializable_rows),
+            "rows": serializable_rows,
+        }
+        logger.info(
+            "Audit query succeeded: %d column(s), %d row(s).",
+            len(columns), len(serializable_rows),
+        )
+        return "SUCCESS: " + json.dumps(result, default=str)
+
+    except snowflake.connector.errors.ProgrammingError as exc:
+        # Compilation / SQL errors land here — return the exact message to the agent.
+        error_msg = f"Error: Snowflake rejected the query. {exc}"
+        logger.error(error_msg)
+        return error_msg
+    except snowflake.connector.errors.Error as exc:
+        error_msg = f"Error: Snowflake execution error. {exc}"
+        logger.error(error_msg)
+        return error_msg
+    except Exception as exc:  # noqa: BLE001
+        error_msg = f"Error: Unexpected error executing test query. Details: {exc}"
+        logger.exception(error_msg)
+        return error_msg
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: raise_github_pr
 # ---------------------------------------------------------------------------
 
 def raise_github_pr(repo_name: str, file_path: str, new_sql: str) -> str:

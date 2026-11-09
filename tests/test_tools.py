@@ -1,9 +1,11 @@
 """
 Unit tests for agent/tools.py.
 
-Tests cover all three tool functions:
+Tests cover all five tool functions:
   - get_airflow_logs
   - get_snowflake_schema
+  - read_code_file
+  - execute_test_query
   - raise_github_pr
 """
 
@@ -13,7 +15,13 @@ import requests_mock as requests_mock_module
 from unittest.mock import patch, MagicMock, PropertyMock
 from github import GithubException
 
-from agent.tools import get_airflow_logs, get_snowflake_schema, raise_github_pr
+from agent.tools import (
+    get_airflow_logs,
+    get_snowflake_schema,
+    read_code_file,
+    execute_test_query,
+    raise_github_pr,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -22,25 +30,40 @@ from agent.tools import get_airflow_logs, get_snowflake_schema, raise_github_pr
 
 class TestGetAirflowLogs:
 
-    def test_get_airflow_logs_success(self, requests_mock):
-        """Successful log retrieval returns the content string from JSON response."""
-        url = (
-            "http://localhost:8080/api/v1/dags/test_dag"
-            "/dagRuns/latest/taskInstances/test_task/logs/1"
+    # The Airflow v2 flow is two-step: list dagRuns, then fetch logs for a run.
+    _RUNS_URL = (
+        "http://localhost:8080/api/v2/dags/test_dag/dagRuns"
+        "?limit=10&order_by=-start_date"
+    )
+
+    def _logs_url(self, run_id: str = "run1", task_id: str = "test_task") -> str:
+        return (
+            f"http://localhost:8080/api/v2/dags/test_dag"
+            f"/dagRuns/{run_id}/taskInstances/{task_id}/logs/1"
         )
-        requests_mock.get(url, json={"content": "log output"})
+
+    def test_get_airflow_logs_success(self, requests_mock):
+        """Successful log retrieval returns the joined event text from the v2 response."""
+        requests_mock.get(
+            "http://localhost:8080/api/v2/dags/test_dag/dagRuns",
+            json={"dag_runs": [{"dag_run_id": "run1", "state": "failed"}]},
+        )
+        requests_mock.get(
+            self._logs_url("run1"),
+            json={"content": [{"event": "log output"}]},
+        )
 
         result = get_airflow_logs("test_dag", "test_task")
 
         assert result == "log output"
 
     def test_get_airflow_logs_http_error(self, requests_mock):
-        """A non-200 response results in an error string."""
-        url = (
-            "http://localhost:8080/api/v1/dags/test_dag"
-            "/dagRuns/latest/taskInstances/test_task/logs/1"
+        """A non-200 response on the dagRuns listing results in an error string."""
+        requests_mock.get(
+            "http://localhost:8080/api/v2/dags/test_dag/dagRuns",
+            status_code=404,
+            text="Not Found",
         )
-        requests_mock.get(url, status_code=404, text="Not Found")
 
         result = get_airflow_logs("test_dag", "test_task")
 
@@ -48,11 +71,10 @@ class TestGetAirflowLogs:
 
     def test_get_airflow_logs_connection_error(self, requests_mock):
         """A ConnectionError results in an error string."""
-        url = (
-            "http://localhost:8080/api/v1/dags/test_dag"
-            "/dagRuns/latest/taskInstances/test_task/logs/1"
+        requests_mock.get(
+            "http://localhost:8080/api/v2/dags/test_dag/dagRuns",
+            exc=requests.exceptions.ConnectionError,
         )
-        requests_mock.get(url, exc=requests.exceptions.ConnectionError)
 
         result = get_airflow_logs("test_dag", "test_task")
 
@@ -60,13 +82,12 @@ class TestGetAirflowLogs:
 
     def test_get_airflow_logs_returns_string(self, requests_mock):
         """Return type is always str regardless of outcome."""
-        url = (
-            "http://localhost:8080/api/v1/dags/any_dag"
-            "/dagRuns/latest/taskInstances/any_task/logs/1"
+        requests_mock.get(
+            "http://localhost:8080/api/v2/dags/test_dag/dagRuns",
+            exc=requests.exceptions.ConnectionError,
         )
-        requests_mock.get(url, exc=requests.exceptions.ConnectionError)
 
-        result = get_airflow_logs("any_dag", "any_task")
+        result = get_airflow_logs("test_dag", "test_task")
 
         assert isinstance(result, str)
 
@@ -409,3 +430,126 @@ class TestRaiseGithubPr:
         result = raise_github_pr("owner/repo", "file.sql", "SELECT 1")
 
         assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# read_code_file
+# ---------------------------------------------------------------------------
+
+class TestReadCodeFile:
+
+    def test_read_existing_file(self, tmp_path, monkeypatch):
+        """Reads raw content when the file exists under AIRFLOW_DAGS_DIR."""
+        monkeypatch.setenv("AIRFLOW_DAGS_DIR", str(tmp_path))
+        model_dir = tmp_path / "dbt_project" / "models"
+        model_dir.mkdir(parents=True)
+        model_file = model_dir / "stg_customers.sql"
+        model_file.write_text("select cust_id as customer_id from raw", encoding="utf-8")
+
+        result = read_code_file("dbt_project/models/stg_customers.sql")
+
+        assert result == "select cust_id as customer_id from raw"
+
+    def test_read_missing_file_returns_error(self, tmp_path, monkeypatch):
+        """Missing file returns a descriptive error string, never raises."""
+        monkeypatch.setenv("AIRFLOW_DAGS_DIR", str(tmp_path))
+
+        result = read_code_file("dbt_project/models/does_not_exist.sql")
+
+        assert isinstance(result, str)
+        assert result.startswith("Error:")
+        assert "not found" in result.lower()
+
+    def test_read_forward_slash_path_on_any_os(self, tmp_path, monkeypatch):
+        """Forward-slash relative paths resolve correctly regardless of OS."""
+        monkeypatch.setenv("AIRFLOW_DAGS_DIR", str(tmp_path))
+        f = tmp_path / "a" / "b.sql"
+        f.parent.mkdir(parents=True)
+        f.write_text("SELECT 1", encoding="utf-8")
+
+        result = read_code_file("a/b.sql")
+
+        assert result == "SELECT 1"
+
+
+# ---------------------------------------------------------------------------
+# execute_test_query (Audit Layer)
+# ---------------------------------------------------------------------------
+
+class TestExecuteTestQuery:
+
+    def _set_env(self, monkeypatch):
+        monkeypatch.setenv("SNOWFLAKE_USER", "u")
+        monkeypatch.setenv("SNOWFLAKE_PASSWORD", "p")
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "myaccount")
+        monkeypatch.setenv("SNOWFLAKE_WAREHOUSE", "w")
+        monkeypatch.setenv("SNOWFLAKE_DATABASE", "d")
+        monkeypatch.setenv("SNOWFLAKE_SCHEMA", "s")
+
+    def test_success_returns_rows(self, monkeypatch):
+        """A valid query returns a SUCCESS-prefixed string with columns and rows."""
+        self._set_env(monkeypatch)
+
+        mock_cursor = MagicMock()
+        mock_cursor.description = [("CUSTOMER_ID",), ("EMAIL",)]
+        mock_cursor.fetchall.return_value = [
+            ("CUST-001", "a@example.com"),
+            ("CUST-002", "b@example.com"),
+        ]
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+
+        with patch("snowflake.connector.connect", return_value=mock_conn):
+            result = execute_test_query(
+                "SELECT cust_id AS customer_id, email FROM d.s.RAW_CUSTOMERS LIMIT 5"
+            )
+
+        assert result.startswith("SUCCESS:")
+        assert "CUSTOMER_ID" in result
+        assert "a@example.com" in result
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+    def test_compilation_error_returns_exact_message(self, monkeypatch):
+        """A ProgrammingError returns the exact Snowflake error so the agent can iterate."""
+        import snowflake.connector
+
+        self._set_env(monkeypatch)
+
+        err = snowflake.connector.errors.ProgrammingError(
+            msg="SQL compilation error: invalid identifier 'NONEXISTENT_COL'"
+        )
+        with patch("snowflake.connector.connect", side_effect=err):
+            result = execute_test_query("SELECT nonexistent_col FROM d.s.t LIMIT 5")
+
+        assert result.startswith("Error:")
+        assert "invalid identifier" in result
+
+    def test_missing_env_returns_error(self, monkeypatch):
+        """Missing Snowflake env vars return an error string."""
+        for var in ["SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD", "SNOWFLAKE_ACCOUNT",
+                    "SNOWFLAKE_WAREHOUSE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA"]:
+            monkeypatch.delenv(var, raising=False)
+
+        result = execute_test_query("SELECT 1")
+
+        assert result.startswith("Error:")
+        assert "Missing" in result
+
+    def test_empty_query_returns_error(self, monkeypatch):
+        """An empty query is rejected before connecting."""
+        self._set_env(monkeypatch)
+
+        result = execute_test_query("   ")
+
+        assert result.startswith("Error:")
+
+    def test_always_returns_string(self, monkeypatch):
+        """Return type is always str, even on unexpected errors."""
+        self._set_env(monkeypatch)
+
+        with patch("snowflake.connector.connect", side_effect=Exception("boom")):
+            result = execute_test_query("SELECT 1")
+
+        assert isinstance(result, str)
+        assert result.startswith("Error:")

@@ -27,7 +27,13 @@ import google.generativeai as genai
 from google.api_core.exceptions import DeadlineExceeded, ServiceUnavailable
 from dotenv import load_dotenv
 
-from agent.tools import get_airflow_logs, get_snowflake_schema, raise_github_pr
+from agent.tools import (
+    get_airflow_logs,
+    get_snowflake_schema,
+    read_code_file,
+    execute_test_query,
+    raise_github_pr,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level logging configuration
@@ -57,9 +63,66 @@ class TriageAgent:
         model (genai.GenerativeModel): Configured Gemini model with tool definitions.
     """
 
-    # Gemini model to use — gemini-1.5-flash is cost-efficient and fast enough
-    # for agentic orchestration workloads of this kind.
+    # Gemini model to use. This account requires gemini-3.8-flash (the API returns
+    # a 404 for gemini-2.5-flash: "no longer available to new users").
     MODEL_NAME = "gemini-3.8-flash"
+
+    # System instruction enforcing the strict, generalized Audit Workflow. This
+    # turns the agent into a general-purpose self-healer for any dbt/SQL failure
+    # (syntax errors, schema mismatches, invalid casts, etc.) and makes the
+    # execute_test_query verification a HARD GATE before any Pull Request.
+    SYSTEM_INSTRUCTION = """
+You are an autonomous Data SRE (Site Reliability Engineer) agent responsible for
+diagnosing and repairing failed Airflow/dbt data pipelines. You are a GENERALIZED
+self-healer: you handle ANY failure type (SQL syntax errors, schema/column
+mismatches, invalid casts, missing columns, type errors, etc.), not just one kind.
+
+You operate as a strict AUDIT LAYER. You NEVER submit a fix you have not proven.
+You MUST follow this exact six-step workflow in order:
+
+1. DIAGNOSE
+   - Call get_airflow_logs to read the Airflow/dbt error log.
+   - Identify which dbt model (.sql file) failed and the precise reason
+     (e.g. syntax error, column/schema mismatch, invalid casting).
+
+2. INSPECT
+   - Call read_code_file to fetch the RAW CODE of the failing .sql model.
+   - Do not guess the model's contents — always read the actual file.
+   - If helpful, call get_snowflake_schema to learn the real column names/types
+     of the underlying raw table(s).
+
+3. HYPOTHESIZE
+   - Formulate a corrected SQL snippet that fixes the identified error.
+
+4. AUDIT  (CRITICAL — THIS IS MANDATORY)
+   - BEFORE modifying any code or raising any PR, you MUST call execute_test_query
+     to run your corrected SQL against Snowflake.
+   - Use a bounded test: SELECT ... LIMIT 5 against the underlying raw table(s).
+   - Resolve any dbt Jinja (e.g. {{ source('raw','raw_customers') }},
+     {{ ref(...) }}) into real DATABASE.SCHEMA.TABLE names before testing. The raw
+     source table is typically DATA_OPS_DEMO.RAW.RAW_<NAME>.
+   - This proves the SQL compiles AND handles the real data correctly.
+
+5. ITERATE
+   - If execute_test_query returns a string starting with "Error:", READ the exact
+     Snowflake error, adjust your SQL fix accordingly, and call execute_test_query
+     AGAIN. Repeat until it returns a result starting with "SUCCESS:".
+   - Never give up after a single failed attempt — use the error to learn.
+
+6. COMMIT
+   - ONLY after execute_test_query returns "SUCCESS:" are you permitted to call
+     raise_github_pr with the fully corrected .sql model content.
+   - The new_sql you commit must be the corrected dbt model (keep dbt Jinja such as
+     {{ source(...) }} in the committed file — only the AUDIT test query uses the
+     resolved table names).
+
+HARD RULES:
+- You are FORBIDDEN from calling raise_github_pr before a successful
+  execute_test_query result in the current session.
+- If after several AUDIT iterations you still cannot get a passing query, stop and
+  explain what you tried and the remaining error instead of raising a PR.
+- Be concise in your reasoning between tool calls.
+"""
 
     def __init__(self) -> None:
         """Initialize the TriageAgent by loading credentials and configuring Gemini."""
@@ -107,8 +170,10 @@ class TriageAgent:
         them with the Gemini model so the model can request their invocation
         during the function-calling loop.
         """
-        genai.configure(api_key=self.api_key)
-        logger.info("Gemini API configured with model: %s", self.MODEL_NAME)
+        # Force the REST transport. The default gRPC transport can stall on some
+        # networks (plain HTTPS/REST works reliably), causing hangs/504s.
+        genai.configure(api_key=self.api_key, transport="rest")
+        logger.info("Gemini API configured with model: %s (transport=rest)", self.MODEL_NAME)
 
         # ------------------------------------------------------------------
         # Tool 1: get_airflow_logs
@@ -165,7 +230,66 @@ class TriageAgent:
         )
 
         # ------------------------------------------------------------------
-        # Tool 3: raise_github_pr
+        # Tool 3: read_code_file
+        # ------------------------------------------------------------------
+        read_code_file_declaration = genai.protos.FunctionDeclaration(
+            name="read_code_file",
+            description=(
+                "Reads the raw text content of a source file (e.g. a failing dbt "
+                ".sql model). Use this during the Inspect step to see the ACTUAL "
+                "code of the failing model before formulating a fix. The path is "
+                "relative to the Airflow dags folder "
+                "(e.g. 'dbt_project/models/stg_customers.sql')."
+            ),
+            parameters=genai.protos.Schema(
+                type=genai.protos.Type.OBJECT,
+                properties={
+                    "filepath": genai.protos.Schema(
+                        type=genai.protos.Type.STRING,
+                        description=(
+                            "Path to the file relative to the Airflow dags folder "
+                            "(e.g. 'dbt_project/models/stg_customers.sql')."
+                        ),
+                    ),
+                },
+                required=["filepath"],
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # Tool 4: execute_test_query (Audit Layer)
+        # ------------------------------------------------------------------
+        execute_test_query_declaration = genai.protos.FunctionDeclaration(
+            name="execute_test_query",
+            description=(
+                "AUDIT LAYER. Executes a candidate SQL query against Snowflake and "
+                "returns the result rows on success, or the EXACT Snowflake "
+                "compilation/execution error on failure. You MUST use this to prove "
+                "a proposed SQL fix actually compiles and handles the raw data "
+                "correctly BEFORE raising any Pull Request. Use a bounded query such "
+                "as 'SELECT ... LIMIT 5' against the underlying raw tables. Resolve "
+                "any dbt Jinja (e.g. {{ source(...) }}) to real DATABASE.SCHEMA.TABLE "
+                "names before calling. If it returns an error, read the error, revise "
+                "your SQL, and call this tool again until it succeeds."
+            ),
+            parameters=genai.protos.Schema(
+                type=genai.protos.Type.OBJECT,
+                properties={
+                    "query": genai.protos.Schema(
+                        type=genai.protos.Type.STRING,
+                        description=(
+                            "The raw Snowflake SQL query to validate "
+                            "(e.g. 'SELECT cust_id AS customer_id, email FROM "
+                            "DATA_OPS_DEMO.RAW.RAW_CUSTOMERS LIMIT 5')."
+                        ),
+                    ),
+                },
+                required=["query"],
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # Tool 5: raise_github_pr
         # ------------------------------------------------------------------
         raise_github_pr_declaration = genai.protos.FunctionDeclaration(
             name="raise_github_pr",
@@ -210,6 +334,8 @@ class TriageAgent:
                 function_declarations=[
                     get_airflow_logs_declaration,
                     get_snowflake_schema_declaration,
+                    read_code_file_declaration,
+                    execute_test_query_declaration,
                     raise_github_pr_declaration,
                 ]
             )
@@ -218,6 +344,7 @@ class TriageAgent:
         self.model = genai.GenerativeModel(
             model_name=self.MODEL_NAME,
             tools=tools,
+            system_instruction=self.SYSTEM_INSTRUCTION,
         )
         logger.info("Gemini GenerativeModel initialised with %d tool(s).", len(tools[0].function_declarations))
 
@@ -275,20 +402,26 @@ class TriageAgent:
         # Initial prompt: describe the failure and instruct the agent
         # ------------------------------------------------------------------
         initial_prompt = f"""
-An Airflow pipeline has failed.
+An Airflow pipeline has failed and needs autonomous healing.
 DAG ID: {dag_id}
 Task ID: {task_id}
 
-Please investigate this failure autonomously:
-1. First, retrieve the Airflow task logs to understand what went wrong.
-2. If you identify a schema mismatch (column name mismatch between the dbt model
-   and Snowflake), query the Snowflake schema to get the actual column names.
-3. Generate corrected SQL that aliases the actual Snowflake column to the expected
-   name (e.g., cust_id AS customer_id).
-4. Raise a GitHub PR with the corrected SQL.
+Follow your six-step Audit Workflow strictly:
+  1. DIAGNOSE  - read the Airflow/dbt logs; find the failing .sql model and the cause.
+  2. INSPECT   - read the raw code of the failing model with read_code_file.
+  3. HYPOTHESIZE - write a corrected SQL fix.
+  4. AUDIT     - validate the fix with execute_test_query (SELECT ... LIMIT 5 against
+                 the resolved raw table) BEFORE touching any code.
+  5. ITERATE   - if the audit query errors, read the error, revise, and re-test until
+                 it returns SUCCESS.
+  6. COMMIT    - only after a SUCCESS audit, raise a GitHub PR with the corrected model.
 
-The dbt model file is at: dbt_project/models/stg_customers.sql
-Use the GitHub repo: {os.environ.get("GITHUB_REPO", "your-org/data-ops-agent-demo")}
+Context you may need:
+  - The failing dbt model is typically under: dbt_project/models/ (read it to confirm).
+  - Raw source tables live in Snowflake as DATA_OPS_DEMO.RAW.RAW_<NAME>.
+  - GitHub repo to use for the PR: {os.environ.get("GITHUB_REPO", "your-org/data-ops-agent-demo")}
+
+Do NOT raise a PR until execute_test_query has returned a SUCCESS result.
 """
 
         logger.info(
@@ -336,11 +469,35 @@ Use the GitHub repo: {os.environ.get("GITHUB_REPO", "your-org/data-ops-agent-dem
                 if func_name == "get_airflow_logs":
                     result = get_airflow_logs(**func_args)
                     response_data = {"result": result}
+                    logger.info(
+                        "get_airflow_logs returned %d chars. Preview: %s",
+                        len(result) if isinstance(result, str) else 0,
+                        (result[:300] if isinstance(result, str) else str(result)),
+                    )
 
                 elif func_name == "get_snowflake_schema":
                     result = get_snowflake_schema(**func_args)
                     # get_snowflake_schema already returns a dict
                     response_data = result
+
+                elif func_name == "read_code_file":
+                    result = read_code_file(**func_args)
+                    response_data = {"result": result}
+                    logger.info(
+                        "read_code_file returned %d chars. Preview: %s",
+                        len(result) if isinstance(result, str) else 0,
+                        (result[:300] if isinstance(result, str) else str(result)),
+                    )
+
+                elif func_name == "execute_test_query":
+                    result = execute_test_query(**func_args)
+                    response_data = {"result": result}
+                    _audit_ok = isinstance(result, str) and result.startswith("SUCCESS:")
+                    logger.info(
+                        "AUDIT execute_test_query -> %s. Preview: %s",
+                        "PASS" if _audit_ok else "FAIL",
+                        (result[:300] if isinstance(result, str) else str(result)),
+                    )
 
                 elif func_name == "raise_github_pr":
                     result = raise_github_pr(**func_args)
@@ -366,6 +523,19 @@ Use the GitHub repo: {os.environ.get("GITHUB_REPO", "your-org/data-ops-agent-dem
 
             # Send all tool results back to Gemini in a single turn
             response = self._send_with_retry(chat, function_responses, _request_options)
+
+            # Log Gemini's reasoning text (if any) after receiving the tool results
+            turn_text = "".join(
+                part.text for part in response.parts
+                if hasattr(part, "text") and part.text
+            )
+            if turn_text.strip():
+                logger.info("Gemini response text after iteration %d: %s", iteration + 1, turn_text[:500])
+            next_calls = [
+                part.function_call.name for part in response.parts
+                if hasattr(part, "function_call") and part.function_call.name
+            ]
+            logger.info("Gemini next tool calls after iteration %d: %s", iteration + 1, next_calls or "none")
 
         # ------------------------------------------------------------------
         # Extract the final text summary from the last Gemini response

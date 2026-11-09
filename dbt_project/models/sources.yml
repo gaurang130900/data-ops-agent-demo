@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: raw
+    database: DATA_OPS_DEMO
+    schema: RAW
+    tables:
+      - name: raw_customers
+      - name: raw_orders
+      - name: raw_products
